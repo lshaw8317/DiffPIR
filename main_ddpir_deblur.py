@@ -3,6 +3,7 @@ import cv2
 import logging
 
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from datetime import datetime
@@ -25,7 +26,6 @@ from guided_diffusion.script_util import (
 )
 
 def main():
-
     # ----------------------------------------
     # Preparation
     # ----------------------------------------
@@ -57,13 +57,23 @@ def main():
     skip_type               = 'quad'            # uniform, quad
     eta                     = 0.0               # eta for ddim sampling
     zeta                    = 0.1  
-    guidance_scale          = 1.0   
+    guidance_scale          = 0.0   
 
     calc_LPIPS              = True
     use_DIY_kernel          = True
     blur_mode               = 'Gaussian'          # Gaussian; motion      
-    kernel_size             = 61
-    kernel_std              = 3.0 if blur_mode == 'Gaussian' else 0.5
+    kernel_size             = 9
+    if blur_mode=='Gaussian':
+        kernel_true_param   = .4
+    else:
+        raise Exception("Hol' up, only Gaussian bois allowed here.")
+
+    ##SAPG
+    SAPG_iters              = int(1e3)
+    sapg_step_size_base     = lambda ii,dimy: 1e1*0.98 * ((ii**(-.8)) / dimy)
+    para_min                = .1
+    para_max                = 1.
+    kernel_init_param       = .8
 
     sf                      = 1
     task_current            = 'deblur'          
@@ -72,7 +82,7 @@ def main():
     model_zoo               = os.path.join(cwd, 'model_zoo')    # fixed
     testsets                = os.path.join(cwd, 'testsets')     # fixed
     results                 = os.path.join(cwd, 'results')      # fixed
-    result_name             = f'{testset_name}_{task_current}_{generate_mode}_{model_name}_sigma{noise_level_img}_NFE{iter_num}_eta{eta}_zeta{zeta}_lambda{lambda_}_blurmode{blur_mode}'
+    result_name             = f'{testset_name}_{task_current}_{generate_mode}_{model_name}_sigma{noise_level_img}_NFE{iter_num}_eta{eta}_zeta{zeta}_lambda{lambda_}_blurmode{blur_mode}_throwaway'
     model_path              = os.path.join(model_zoo, model_name+'.pt')
     device                  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.cuda.empty_cache()
@@ -99,7 +109,6 @@ def main():
     # ----------------------------------------
     # L_path, E_path, H_path
     # ----------------------------------------
-
     L_path = os.path.join(testsets, testset_name) # L_path, for Low-quality images
     E_path = os.path.join(results, result_name)   # E_path, for Estimated images
     util.mkdir(E_path)
@@ -156,27 +165,30 @@ def main():
         if calc_LPIPS:
             test_results['lpips'] = []
 
+        def gen_kernel(param):
+            if blur_mode == 'Gaussian':
+                center = int((kernel_size+1)/ 2)
+                xker = torch.arange(-kernel_size + center, kernel_size - center+1,dtype=torch.float64).to(device).reshape(-1,1)
+                c_exp_term = param**2 * (xker**2 +  xker.T**2)
+                f_kernel = torch.exp(-c_exp_term/2)
+                k_tensor=f_kernel/f_kernel.sum()
+            elif blur_mode == 'motion':
+                kernel = MotionBlurOperator(kernel_size=kernel_size, intensity=kernel_std, device=device)
+                k_tensor = kernel.get_kernel().to(device, dtype=torch.float)
+            k = k_tensor.clone().detach().cpu().numpy()       #[0,1]
+            k = np.squeeze(k)
+            k = np.squeeze(k)
+            return k
+    
         for idx, img in enumerate(L_paths):
             if use_DIY_kernel:
-                np.random.seed(seed=idx*10)  # for reproducibility of blur kernel for each image
-                if blur_mode == 'Gaussian':
-                    kernel_std_i = kernel_std * np.abs(np.random.rand()*2+1)
-                    kernel = GaussialBlurOperator(kernel_size=kernel_size, intensity=kernel_std_i, device=device)
-                elif blur_mode == 'motion':
-                    kernel = MotionBlurOperator(kernel_size=kernel_size, intensity=kernel_std, device=device)
-                k_tensor = kernel.get_kernel().to(device, dtype=torch.float)
-                k = k_tensor.clone().detach().cpu().numpy()       #[0,1]
-                k = np.squeeze(k)
-                k = np.squeeze(k)
+                k = gen_kernel(kernel_true_param)
             else:
                 k_index = 0
                 kernels = hdf5storage.loadmat(os.path.join(cwd, 'kernels', 'Levin09.mat'))['kernels']
                 k = kernels[0, k_index].astype(np.float32)
             img_name, ext = os.path.splitext(os.path.basename(img))
             util.imsave(k*255.*200, os.path.join(E_path, f'motion_kernel_{img_name}.png'))
-            #np.save(os.path.join(E_path, 'motion_kernel.npy'), k)
-            k_4d = torch.from_numpy(k).to(device)
-            k_4d = torch.einsum('ab,cd->abcd',torch.eye(3).to(device),k_4d)
             
             model_out_type = model_output_type
 
@@ -187,16 +199,17 @@ def main():
             img_name, ext = os.path.splitext(os.path.basename(img))
             img_H = util.imread_uint(img, n_channels=n_channels)
             img_H = util.modcrop(img_H, 8)  # modcrop
+            img_h=util.uint2single(img_H)
 
             # mode='wrap' is important for analytical solution
-            img_L = ndimage.convolve(img_H, np.expand_dims(k, axis=2), mode='wrap')
+            img_L = ndimage.convolve(img_h, np.expand_dims(k, axis=2), mode='wrap')
             util.imshow(img_L) if show_img else None
-            img_L = util.uint2single(img_L)
+            #img_L = util.uint2single(img_L)
 
             np.random.seed(seed=0)  # for reproducibility
-            img_L = img_L * 2 - 1
-            img_L += np.random.normal(0, noise_level_img * 2, img_L.shape) # add AWGN
-            img_L = img_L / 2 + 0.5
+            #img_L = img_L * 2 - 1
+            img_L += np.random.normal(0, noise_level_img, img_L.shape) # add AWGN
+            #img_L = img_L / 2 + 0.5
 
             # --------------------------------
             # (2) get rhos and sigmas
@@ -222,153 +235,189 @@ def main():
             # x = util.single2tensor4(img_L).to(device)
 
             y = util.single2tensor4(img_L).to(device)   #(1,3,256,256)
+            dimy=y.numel()
+            sapg_step_size = lambda ii: sapg_step_size_base(ii,dimy)
+            paras=torch.zeros(SAPG_iters+1)
 
-            # for y with given noise level, add noise from t_y
-            t_y = utils_model.find_nearest(reduced_alpha_cumprod, 2 * noise_level_img)
-            sqrt_alpha_effective = sqrt_alphas_cumprod[t_start] / sqrt_alphas_cumprod[t_y]
-            x = sqrt_alpha_effective * (2*y-1) + torch.sqrt(sqrt_1m_alphas_cumprod[t_start]**2 - \
-                    sqrt_alpha_effective**2 * sqrt_1m_alphas_cumprod[t_y]**2) * torch.randn_like(y)
-            # x = torch.randn_like(y)
+            #----------SAPG enters here---------
+            para_old=torch.tensor(kernel_init_param)
+            paras[0]=kernel_init_param
+            def sapg_grad(para_a,x):
+                x_shape = x.shape #NCHW
+                center = int((kernel_size+1)/ 2)
+                xker = torch.arange(-kernel_size + center, kernel_size - center+1).to(device).reshape(-1,1)
+                c_exp_term = para_a**2 * (xker**2 +  xker.T**2)
 
-            k_tensor = util.single2tensor4(np.expand_dims(k, 2)).to(device)
+                f_kernel = ((para_a**2 ) / (2*torch.pi)) * torch.exp(-c_exp_term/2)
+                diffa = (para_a / (2*torch.pi)) * (2 - c_exp_term) * torch.exp(-c_exp_term / 2)
+                norm_kernel=torch.sum(f_kernel)
+                norm_diff_a=torch.sum(diffa) 
+                diffa_kernel = (diffa * norm_kernel - f_kernel * norm_diff_a) / (norm_kernel**2)
+                kernel_f=(f_kernel/norm_kernel)[None,None,...]
 
-            FB, FBC, F2B, FBFy = sr.pre_calculate(y, k_tensor, sf)
+                FB = sr.p2o(diffa_kernel[None,None,...], x_shape[-2:]) #needs to be NCHW shape
+                fftx=torch.fft.fftn(x, dim=(-2, -1))
+                gradH_para_x=torch.real(torch.fft.ifftn(FB*fftx,dim=(-2, -1)))
+                FB = sr.p2o(kernel_f, x_shape[-2:]) #needs to be NCHW shape
+                H_para_x=torch.real(torch.fft.ifftn(FB*fftx,dim=(-2, -1)))
+                
+                return torch.sum(gradH_para_x * (H_para_x - y)) /sigma**2
 
-            # --------------------------------
-            # (4) main iterations
-            # --------------------------------
 
-            progress_img = []
-            # create sequence of timestep for sampling
-            if skip_type == 'uniform':
-                seq = [i*skip for i in range(iter_num)]
-                if skip > 1:
-                    seq.append(num_train_timesteps-1)
-            elif skip_type == "quad":
-                seq = np.sqrt(np.linspace(0, num_train_timesteps**2, iter_num))
-                seq = [int(s) for s in list(seq)]
-                seq[-1] = seq[-1] - 1
-            progress_seq = seq[::max(len(seq)//10,1)]
-            if progress_seq[-1] != seq[-1]:
-                progress_seq.append(seq[-1])
-            
-            # reverse diffusion for one image from random noise
-            for i in range(len(seq)):
-                curr_sigma = sigmas[seq[i]].cpu().numpy()
-                # time step associated with the noise level sigmas[i]
-                t_i = utils_model.find_nearest(reduced_alpha_cumprod,curr_sigma)
-                # skip iters
-                if t_i > t_start:
-                    continue
-                for u in range(iter_num_U):
-                    # --------------------------------
-                    # step 1, reverse diffsuion step
-                    # --------------------------------
+            for ii in range(1,SAPG_iters+1):
+                # for y with given noise level, add noise from t_y
+                t_y = utils_model.find_nearest(reduced_alpha_cumprod, 2 * noise_level_img)
+                sqrt_alpha_effective = sqrt_alphas_cumprod[t_start] / sqrt_alphas_cumprod[t_y]
+                x = sqrt_alpha_effective * (2*y-1) + torch.sqrt(sqrt_1m_alphas_cumprod[t_start]**2 - \
+                        sqrt_alpha_effective**2 * sqrt_1m_alphas_cumprod[t_y]**2) * torch.randn_like(y)
+                # x = torch.randn_like(y)
 
-                    # solve equation 6b with one reverse diffusion step
-                    if 'DPS' in generate_mode:
-                        x = x.requires_grad_()
-                        xt, x0 = utils_model.model_fn(x, noise_level=curr_sigma*255, model_out_type='pred_x_prev_and_start', \
+                k = gen_kernel(para_old)
+                k_tensor = util.single2tensor4(np.expand_dims(k, 2)).to(device)
+                k_4d = torch.from_numpy(k).to(device)
+                k_4d = torch.einsum('ab,cd->abcd',torch.eye(3).to(device),k_4d)
+                FB, FBC, F2B, FBFy = sr.pre_calculate(y, k_tensor, sf)
+
+                # --------------------------------
+                # (4) main iterations
+                # --------------------------------
+
+                progress_img = []
+                # create sequence of timestep for sampling
+                if skip_type == 'uniform':
+                    seq = [i*skip for i in range(iter_num)]
+                    if skip > 1:
+                        seq.append(num_train_timesteps-1)
+                elif skip_type == "quad":
+                    seq = np.sqrt(np.linspace(0, num_train_timesteps**2, iter_num))
+                    seq = [int(s) for s in list(seq)]
+                    seq[-1] = seq[-1] - 1
+                progress_seq = seq[::max(len(seq)//10,1)]
+                if progress_seq[-1] != seq[-1]:
+                    progress_seq.append(seq[-1])
+                
+                # reverse diffusion for one image from random noise
+                for i in range(len(seq)):
+                    curr_sigma = sigmas[seq[i]].cpu().numpy()
+                    # time step associated with the noise level sigmas[i]
+                    t_i = utils_model.find_nearest(reduced_alpha_cumprod,curr_sigma)
+                    # skip iters
+                    if t_i > t_start:
+                        continue
+                    for u in range(iter_num_U):
+                        # --------------------------------
+                        # step 1, reverse diffsuion step
+                        # --------------------------------
+
+                        # solve equation 6b with one reverse diffusion step
+                        if 'DPS' in generate_mode:
+                            x = x.requires_grad_()
+                            xt, x0 = utils_model.model_fn(x, noise_level=curr_sigma*255, model_out_type='pred_x_prev_and_start', \
+                                        model_diffusion=model, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
+                        else:
+                            x0 = utils_model.model_fn(x, noise_level=curr_sigma*255, model_out_type=model_out_type, \
                                     model_diffusion=model, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
-                    else:
-                        x0 = utils_model.model_fn(x, noise_level=curr_sigma*255, model_out_type=model_out_type, \
-                                model_diffusion=model, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
-                    # x0 = utils_model.test_mode(utils_model.model_fn, model, x, mode=2, refield=32, min_size=256, modulo=16, noise_level=curr_sigma*255, \
-                    #   model_out_type=model_out_type, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
+                        # x0 = utils_model.test_mode(utils_model.model_fn, model, x, mode=2, refield=32, min_size=256, modulo=16, noise_level=curr_sigma*255, \
+                        #   model_out_type=model_out_type, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
 
-                    # --------------------------------
-                    # step 2, FFT
-                    # --------------------------------
+                        # --------------------------------
+                        # step 2, FFT
+                        # --------------------------------
 
-                    if seq[i] != seq[-1]:
-                        if generate_mode == 'DiffPIR':
-                            if sub_1_analytic:
-                                if model_out_type == 'pred_xstart':
-                                    tau = rhos[t_i].float().repeat(1, 1, 1, 1)
-                                    # when noise level less than given image noise, skip
-                                    if i < num_train_timesteps-noise_model_t: 
-                                        x0_p = x0 / 2 + 0.5
-                                        x0_p = sr.data_solution(x0_p.float(), FB, FBC, F2B, FBFy, tau, sf)
-                                        x0_p = x0_p * 2 - 1
-                                        # effective x0
-                                        x0 = x0 + guidance_scale * (x0_p-x0)
-                                    else:
-                                        model_out_type = 'pred_x_prev'
-                                        x0 = utils_model.model_fn(x, noise_level=curr_sigma*255, model_out_type=model_out_type, \
-                                                model_diffusion=model, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
-                                        # x0 = utils_model.test_mode(utils_model.model_fn, model, x, mode=2, refield=32, min_size=256, modulo=16, noise_level=curr_sigma*255, \
-                                        #   model_out_type=model_out_type, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
-                                        pass
-                            else:
-                                # zeta=0.28; lambda_=7
-                                x0 = x0.requires_grad_()
-                                # first order solver
+                        if seq[i] != seq[-1]:
+                            if generate_mode == 'DiffPIR':
+                                if sub_1_analytic:
+                                    if model_out_type == 'pred_xstart':
+                                        tau = rhos[t_i].float().repeat(1, 1, 1, 1)
+                                        # when noise level less than given image noise, skip
+                                        if i < num_train_timesteps-noise_model_t: 
+                                            x0_p = x0 / 2 + 0.5
+                                            x0_p = sr.data_solution(x0_p.float(), FB, FBC, F2B, FBFy, tau, sf)
+                                            x0_p = x0_p * 2 - 1
+                                            # effective x0
+                                            x0 = x0 + guidance_scale * (x0_p-x0)
+                                        else:
+                                            model_out_type = 'pred_x_prev'
+                                            x0 = utils_model.model_fn(x, noise_level=curr_sigma*255, model_out_type=model_out_type, \
+                                                    model_diffusion=model, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
+                                            # x0 = utils_model.test_mode(utils_model.model_fn, model, x, mode=2, refield=32, min_size=256, modulo=16, noise_level=curr_sigma*255, \
+                                            #   model_out_type=model_out_type, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
+                                            pass
+                                else:
+                                    # zeta=0.28; lambda_=7
+                                    x0 = x0.requires_grad_()
+                                    # first order solver
+                                    def Tx(x):
+                                        x = x / 2 + 0.5
+                                        pad_2d = torch.nn.ReflectionPad2d(k.shape[0]//2)
+                                        x_deblur = F.conv2d(pad_2d(x), k_4d)
+                                        return x_deblur
+                                    norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=x0, x_hat=x0, measurement=y)
+                                    x0 = x0 - norm_grad * norm / (rhos[t_i])
+                                    x0 = x0.detach_()
+                                    pass                               
+                            elif 'DPS' in generate_mode:
                                 def Tx(x):
                                     x = x / 2 + 0.5
                                     pad_2d = torch.nn.ReflectionPad2d(k.shape[0]//2)
                                     x_deblur = F.conv2d(pad_2d(x), k_4d)
                                     return x_deblur
-                                norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=x0, x_hat=x0, measurement=y)
-                                x0 = x0 - norm_grad * norm / (rhos[t_i])
-                                x0 = x0.detach_()
-                                pass                               
-                        elif 'DPS' in generate_mode:
-                            def Tx(x):
-                                x = x / 2 + 0.5
-                                pad_2d = torch.nn.ReflectionPad2d(k.shape[0]//2)
-                                x_deblur = F.conv2d(pad_2d(x), k_4d)
-                                return x_deblur
-                                #return kernel.forward(x)                         
-                            if generate_mode == 'DPS_y0':
-                                norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=x, x_hat=x0, measurement=y)
-                                #norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=xt, x_hat=x0, measurement=y)    # does not work
-                                x = xt - norm_grad * 1. #norm / (2*rhos[t_i]) 
-                                x = x.detach_()
-                                pass
-                            elif generate_mode == 'DPS_yt':
-                                y_t = sqrt_alphas_cumprod[t_i] * (2*y-1) + sqrt_1m_alphas_cumprod[t_i] * torch.randn_like(y) # add AWGN
-                                y_t = y_t/2 + 0.5
-                                ### it's equivalent to use x & xt (?), but with xt the computation is faster.
-                                #norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=x, x_hat=xt, measurement=y_t)
-                                norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=xt, x_hat=xt, measurement=y_t)
-                                x = xt - norm_grad * lambda_ * norm / (rhos[t_i]) * 0.35
-                                x = x.detach_()
-                                pass
+                                    #return kernel.forward(x)                         
+                                if generate_mode == 'DPS_y0':
+                                    norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=x, x_hat=x0, measurement=y)
+                                    #norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=xt, x_hat=x0, measurement=y)    # does not work
+                                    x = xt - norm_grad * 1. #norm / (2*rhos[t_i]) 
+                                    x = x.detach_()
+                                    pass
+                                elif generate_mode == 'DPS_yt':
+                                    y_t = sqrt_alphas_cumprod[t_i] * (2*y-1) + sqrt_1m_alphas_cumprod[t_i] * torch.randn_like(y) # add AWGN
+                                    y_t = y_t/2 + 0.5
+                                    ### it's equivalent to use x & xt (?), but with xt the computation is faster.
+                                    #norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=x, x_hat=xt, measurement=y_t)
+                                    norm_grad, norm = utils_model.grad_and_value(operator=Tx,x=xt, x_hat=xt, measurement=y_t)
+                                    x = xt - norm_grad * lambda_ * norm / (rhos[t_i]) * 0.35
+                                    x = x.detach_()
+                                    pass
 
-                    if (generate_mode == 'DiffPIR' and model_out_type == 'pred_xstart') and not (seq[i] == seq[-1] and u == iter_num_U-1):
-                        #x = sqrt_alphas_cumprod[t_i] * (x0) + (sqrt_1m_alphas_cumprod[t_i]) *  torch.randn_like(x)
+                        if (generate_mode == 'DiffPIR' and model_out_type == 'pred_xstart') and not (seq[i] == seq[-1] and u == iter_num_U-1):
+                            #x = sqrt_alphas_cumprod[t_i] * (x0) + (sqrt_1m_alphas_cumprod[t_i]) *  torch.randn_like(x)
+                            
+                            t_im1 = utils_model.find_nearest(reduced_alpha_cumprod,sigmas[seq[i+1]].cpu().numpy())
+                            # calculate \hat{\eposilon}
+                            eps = (x - sqrt_alphas_cumprod[t_i] * x0) / sqrt_1m_alphas_cumprod[t_i]
+                            eta_sigma = eta * sqrt_1m_alphas_cumprod[t_im1] / sqrt_1m_alphas_cumprod[t_i] * torch.sqrt(betas[t_i])
+                            x = sqrt_alphas_cumprod[t_im1] * x0 + np.sqrt(1-zeta) * (torch.sqrt(sqrt_1m_alphas_cumprod[t_im1]**2 - eta_sigma**2) * eps \
+                                        + eta_sigma * torch.randn_like(x)) + np.sqrt(zeta) * sqrt_1m_alphas_cumprod[t_im1] * torch.randn_like(x)
+                        else:
+                            # x = x0
+                            pass
+                            
+                        # set back to x_t from x_{t-1}
+                        if u < iter_num_U-1 and seq[i] != seq[-1]:
+                            # x = torch.sqrt(alphas[t_i]) * x + torch.sqrt(betas[t_i]) * torch.randn_like(x)
+                            sqrt_alpha_effective = sqrt_alphas_cumprod[t_i] / sqrt_alphas_cumprod[t_im1]
+                            x = sqrt_alpha_effective * x + torch.sqrt(sqrt_1m_alphas_cumprod[t_i]**2 - \
+                                    sqrt_alpha_effective**2 * sqrt_1m_alphas_cumprod[t_im1]**2) * torch.randn_like(x)
+
+                    # save the process
+                    x_0 = (x/2+0.5)
+                    if save_progressive and (seq[i] in progress_seq):
+                        x_show = x_0.clone().detach().cpu().numpy()       #[0,1]
+                        x_show = np.squeeze(x_show)
+                        if x_show.ndim == 3:
+                            x_show = np.transpose(x_show, (1, 2, 0))
+                        progress_img.append(x_show)
+                        if log_process:
+                            logger.info('{:>4d}, steps: {:>4d}, np.max(x_show): {:.4f}, np.min(x_show): {:.4f}'.format(seq[i], t_i, np.max(x_show), np.min(x_show)))
                         
-                        t_im1 = utils_model.find_nearest(reduced_alpha_cumprod,sigmas[seq[i+1]].cpu().numpy())
-                        # calculate \hat{\eposilon}
-                        eps = (x - sqrt_alphas_cumprod[t_i] * x0) / sqrt_1m_alphas_cumprod[t_i]
-                        eta_sigma = eta * sqrt_1m_alphas_cumprod[t_im1] / sqrt_1m_alphas_cumprod[t_i] * torch.sqrt(betas[t_i])
-                        x = sqrt_alphas_cumprod[t_im1] * x0 + np.sqrt(1-zeta) * (torch.sqrt(sqrt_1m_alphas_cumprod[t_im1]**2 - eta_sigma**2) * eps \
-                                    + eta_sigma * torch.randn_like(x)) + np.sqrt(zeta) * sqrt_1m_alphas_cumprod[t_im1] * torch.randn_like(x)
-                    else:
-                        # x = x0
-                        pass
-                        
-                    # set back to x_t from x_{t-1}
-                    if u < iter_num_U-1 and seq[i] != seq[-1]:
-                        # x = torch.sqrt(alphas[t_i]) * x + torch.sqrt(betas[t_i]) * torch.randn_like(x)
-                        sqrt_alpha_effective = sqrt_alphas_cumprod[t_i] / sqrt_alphas_cumprod[t_im1]
-                        x = sqrt_alpha_effective * x + torch.sqrt(sqrt_1m_alphas_cumprod[t_i]**2 - \
-                                sqrt_alpha_effective**2 * sqrt_1m_alphas_cumprod[t_im1]**2) * torch.randn_like(x)
-
-                # save the process
-                x_0 = (x/2+0.5)
-                if save_progressive and (seq[i] in progress_seq):
-                    x_show = x_0.clone().detach().cpu().numpy()       #[0,1]
-                    x_show = np.squeeze(x_show)
-                    if x_show.ndim == 3:
-                        x_show = np.transpose(x_show, (1, 2, 0))
-                    progress_img.append(x_show)
-                    if log_process:
-                        logger.info('{:>4d}, steps: {:>4d}, np.max(x_show): {:.4f}, np.min(x_show): {:.4f}'.format(seq[i], t_i, np.max(x_show), np.min(x_show)))
-                    
-                    if show_img:
-                        util.imshow(x_show)
-
+                        if show_img:
+                            util.imshow(x_show)
+                #SAPG update
+                sg=sapg_grad(para_old,x_0)
+                print(f'stepsize*grad={sapg_step_size(ii)}*{sg}')
+                para_temp=para_old-sapg_step_size(ii)*sg
+                para_old=para_temp.clone().detach()
+                paras[ii]=para_old.item()
 
             # --------------------------------
             # (3) img_E
@@ -422,6 +471,23 @@ def main():
             if save_L:
                 util.imsave(util.single2uint(img_L), os.path.join(E_path, img_name+'_LR.png'))
         
+            #save SAPG iteration history
+                                                                             
+            np.save(os.path.join(E_path, f"gs_{guidance_scale}_paralist_{idx}.npy"), paras)
+
+            #Make and save plot of parameter evolution
+            locpath=E_path
+            plotparas=np.load(os.path.join(locpath, f"gs_{guidance_scale}_paralist_{idx}.npy"))
+            true_para=kernel_true_param
+            my_idx=idx
+            plt.figure()
+            plt.semilogx(plotparas,'b-',label='SAPG parameter estimate')
+            plt.axhline(y=true_para,color='k',ls='--',label='True para val.')
+            plt.title(f'Parameter from SAPG for orig\_{my_idx}. gs={guidance_scale}')
+            plt.xlabel('SAPG Iteration')
+            plt.ylabel('para val.')
+            plt.legend()
+            plt.savefig(os.path.join(E_path, f"gs_{guidance_scale}_SAPGPlot_{my_idx}.pdf"),format='pdf',bbox_inches='tight')
         # --------------------------------
         # Average PSNR and LPIPS
         # --------------------------------
@@ -433,7 +499,19 @@ def main():
         if calc_LPIPS:
             ave_lpips = sum(test_results['lpips']) / len(test_results['lpips'])
             logger.info('------> Average LPIPS of ({}) sigma: ({:.3f}): {:.4f}'.format(testset_name, noise_level_model, ave_lpips))
-
+        
+        ##Save SAPG stuff
+        infodict={'SAPGiters':SAPG_iters,'SAPGpara_init':kernel_init_param, 'deg':{'deg_type':'Gaussian', 'kernel_size':kernel_size, 'true_para':kernel_true_param,'obs_noise':sigma}}
+        with open(os.path.join(E_path, "info_text.txt"),'w') as f:
+            for k,v in infodict.items():
+                if k=='deg':
+                    f.write('deg: ')
+                    for ke,va in v.items():
+                        f.write(f'{ke}={va}, ')
+                    f.write('\n')
+                else:
+                    f.write(f'{k}={v}\n')
+        
     
     # experiments
     lambdas = [lambda_*i for i in range(7,8)]
