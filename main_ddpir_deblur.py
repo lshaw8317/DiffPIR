@@ -243,6 +243,9 @@ def main():
             para_old=torch.tensor(kernel_init_param)
             paras[0]=kernel_init_param
             def sapg_grad(para_a,x):
+		'''
+                Assumes x in [0,1] scale since y is
+                '''
                 x_shape = x.shape #NCHW
                 center = int((kernel_size+1)/ 2)
                 xker = torch.arange(-kernel_size + center, kernel_size - center+1).to(device).reshape(-1,1)
