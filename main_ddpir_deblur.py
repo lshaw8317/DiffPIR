@@ -419,7 +419,7 @@ def main():
                 sg=sapg_grad(para_old,x_0)
                 print(f'stepsize*grad={sapg_step_size(ii)}*{sg}')
                 para_temp=para_old-sapg_step_size(ii)*sg
-                para_old=para_temp.clone().detach()
+                para_old=torch.clamp(para_temp,min=para_min, max=para_max).clone().detach()
                 paras[ii]=para_old.item()
 
             # --------------------------------
