@@ -57,7 +57,7 @@ def main():
     skip_type               = 'quad'            # uniform, quad
     eta                     = 0.0               # eta for ddim sampling
     zeta                    = 0.1  
-    guidance_scale          = 0.0   
+    guidance_scale          = 1.0   
 
     calc_LPIPS              = True
     use_DIY_kernel          = True
@@ -476,21 +476,21 @@ def main():
         
             #save SAPG iteration history
                                                                              
-            np.save(os.path.join(E_path, f"gs_{guidance_scale}_paralist_{idx}.npy"), paras)
+            np.save(os.path.join(E_path, f"paralist_{idx}.npy"), paras)
 
             #Make and save plot of parameter evolution
             locpath=E_path
-            plotparas=np.load(os.path.join(locpath, f"gs_{guidance_scale}_paralist_{idx}.npy"))
+            plotparas=np.load(os.path.join(locpath, f"paralist_{idx}.npy"))
             true_para=kernel_true_param
             my_idx=idx
             plt.figure()
             plt.semilogx(plotparas,'b-',label='SAPG parameter estimate')
             plt.axhline(y=true_para,color='k',ls='--',label='True para val.')
-            plt.title(f'Parameter from SAPG for orig\_{my_idx}. gs={guidance_scale}')
+            plt.title(f'Parameter from SAPG for orig\_{my_idx}')
             plt.xlabel('SAPG Iteration')
             plt.ylabel('para val.')
             plt.legend()
-            plt.savefig(os.path.join(E_path, f"gs_{guidance_scale}_SAPGPlot_{my_idx}.pdf"),format='pdf',bbox_inches='tight')
+            plt.savefig(os.path.join(E_path, f"SAPGPlot_{my_idx}.pdf"),format='pdf',bbox_inches='tight')
         # --------------------------------
         # Average PSNR and LPIPS
         # --------------------------------
